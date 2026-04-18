@@ -3,6 +3,26 @@ import urllib.parse
 import random
 import httpx
 import asyncio
+import time
+
+GLOBAL_POOL = []
+API_CACHE = {}
+
+async def fetch_datamuse(url: str, client: httpx.AsyncClient):
+    global API_CACHE
+    if url in API_CACHE:
+        return API_CACHE[url]
+    try:
+        resp = await client.get(url)
+        if resp.status_code == 200:
+            data = resp.json()
+            if len(API_CACHE) > 5000:
+                API_CACHE.clear()
+            API_CACHE[url] = data
+            return data
+    except Exception:
+        pass
+    return []
 
 
 class State(rx.State):
@@ -81,7 +101,7 @@ class State(rx.State):
         try:
             url = f"https://api.datamuse.com/words?ml={urllib.parse.quote(end)}&max=1000"
             async with httpx.AsyncClient(timeout=10.0) as client:
-                nRes = (await client.get(url)).json()
+                nRes = await fetch_datamuse(url, client)
             self.targetNeighborhood = {item["word"]: item.get("score", 0) for item in nRes}
         except Exception:
             self.targetNeighborhood = {}
@@ -111,52 +131,44 @@ class State(rx.State):
         return normalized
 
     async def getWord(self):
+        global GLOBAL_POOL
         try:
-            anchors = ["thing", "place", "concept", "world", "system", "life", "action"]
+            if not GLOBAL_POOL:
+                anchors = ["thing", "place", "concept", "world", "system", "life", "action"]
+                async with httpx.AsyncClient(timeout=15.0) as client:
+                    anchorResponses = await asyncio.gather(
+                        *[fetch_datamuse(f"https://api.datamuse.com/words?ml={anchor}&max=300&md=f", client) for anchor in anchors]
+                    )
+
+                    pool = set()
+                    for resp_data in anchorResponses:
+                        for w in resp_data:
+                            if "tags" in w and any(t.startswith("f:") and float(t[2:]) > 1.0 for t in w["tags"]):
+                                pool.add(w["word"])
+
+                    poolList = list(pool)
+                    if len(poolList) < 20:
+                        poolList = ["water", "fire", "earth", "air", "light", "dark", "sound", "time", "space", "nature"]
+                    GLOBAL_POOL = poolList
+
+            attempts = 0
+            while attempts < 20:
+                w1 = random.choice(GLOBAL_POOL)
+                w2 = random.choice(GLOBAL_POOL)
+                if w1 != w2:
+                    self.previousWord = w1
+                    self.targetWord = w2
+                    break
+                attempts += 1
+
+            self.wordPath = [self.previousWord]
+            self.feedback = ""
+            self.hasWon = False
+
+            neighborhoodUrl = f"https://api.datamuse.com/words?ml={urllib.parse.quote(self.targetWord)}&max=1000"
             async with httpx.AsyncClient(timeout=15.0) as client:
-                anchorResponses = await asyncio.gather(
-                    *[client.get(f"https://api.datamuse.com/words?ml={anchor}&max=300&md=f") for anchor in anchors]
-                )
-
-                pool = set()
-                for resp in anchorResponses:
-                    for w in resp.json():
-                        if "tags" in w and any(t.startswith("f:") and float(t[2:]) > 1.0 for t in w["tags"]):
-                            pool.add(w["word"])
-
-                poolList = list(pool)
-                if len(poolList) < 2:
-                    poolList = ["water", "fire", "earth", "air", "light", "dark", "sound", "time"]
-
-                attempts = 0
-                while attempts < 20:
-                    w1 = random.choice(poolList)
-                    w2 = random.choice(poolList)
-
-                    if w1 == w2:
-                        attempts += 1
-                        continue
-
-                    checkUrl = f"https://api.datamuse.com/words?ml={urllib.parse.quote(w1)}&sp={urllib.parse.quote(w2)}"
-                    relation = (await client.get(checkUrl)).json()
-
-                    if not relation:
-                        self.previousWord = w1
-                        self.targetWord = w2
-                        break
-
-                    attempts += 1
-                else:
-                    self.previousWord = random.choice(poolList)
-                    self.targetWord = random.choice(poolList)
-
-                self.wordPath = [self.previousWord]
-                self.feedback = ""
-                self.hasWon = False
-
-                neighborhoodUrl = f"https://api.datamuse.com/words?ml={urllib.parse.quote(self.targetWord)}&max=1000"
-                nRes = (await client.get(neighborhoodUrl)).json()
-                self.targetNeighborhood = {item["word"]: item.get("score", 0) for item in nRes}
+                nRes = await fetch_datamuse(neighborhoodUrl, client)
+            self.targetNeighborhood = {item["word"]: item.get("score", 0) for item in nRes}
 
             self.proximityScore = self.getWordSimilarity(self.previousWord)
             self.lastProximityScore = self.proximityScore
@@ -181,24 +193,24 @@ class State(rx.State):
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 mlRes, trgRes, synRes = await asyncio.gather(
-                    client.get(f"https://api.datamuse.com/words?ml={safeWord}&max=1000"),
-                    client.get(f"https://api.datamuse.com/words?rel_trg={safeWord}&max=1000"),
-                    client.get(f"https://api.datamuse.com/words?rel_syn={safeWord}&max=1000"),
+                    fetch_datamuse(f"https://api.datamuse.com/words?ml={safeWord}&max=1000", client),
+                    fetch_datamuse(f"https://api.datamuse.com/words?rel_trg={safeWord}&max=1000", client),
+                    fetch_datamuse(f"https://api.datamuse.com/words?rel_syn={safeWord}&max=1000", client),
                 )
 
                 validWords = (
-                    {w["word"].lower() for w in mlRes.json()} |
-                    {w["word"].lower() for w in trgRes.json()} |
-                    {w["word"].lower() for w in synRes.json()}
+                    {w["word"].lower() for w in mlRes} |
+                    {w["word"].lower() for w in trgRes} |
+                    {w["word"].lower() for w in synRes}
                 )
 
                 if searchWord == self.targetWord.lower():
                     isValid = searchWord in validWords
 
                     if not isValid:
-                        relation = (await client.get(
-                            f"https://api.datamuse.com/words?ml={safeWord}&sp={urllib.parse.quote(searchWord)}"
-                        )).json()
+                        relation = await fetch_datamuse(
+                            f"https://api.datamuse.com/words?ml={safeWord}&sp={urllib.parse.quote(searchWord)}", client
+                        )
                         if relation:
                             isValid = True
 
